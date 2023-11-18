@@ -11,16 +11,23 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/openshift-kni/eco-goinfra/pkg/clients"
-	metalLbV1Beta1 "go.universe.tf/metallb/api/v1beta1"
+	"github.com/openshift-kni/eco-goinfra/pkg/metallb/types"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	goclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+const (
+	bfdProfileKind = "BFDProfile"
+	bfdAPIGroup    = "metallb.io"
+	bfdAPIVersion  = "v1beta1"
 )
 
 // BFDBuilder provides struct for the BFDProfile object containing connection to
 // the cluster and the BFDProfile definitions.
 type BFDBuilder struct {
-	Definition *metalLbV1Beta1.BFDProfile
-	Object     *metalLbV1Beta1.BFDProfile
+	Definition *types.BFDProfile
+	Object     *types.BFDProfile
 	apiClient  *clients.Settings
 	errorMsg   string
 }
@@ -36,7 +43,11 @@ func NewBFDBuilder(apiClient *clients.Settings, name, nsname string) *BFDBuilder
 
 	builder := BFDBuilder{
 		apiClient: apiClient,
-		Definition: &metalLbV1Beta1.BFDProfile{
+		Definition: &types.BFDProfile{
+			TypeMeta: metaV1.TypeMeta{
+				Kind:       bfdProfileKind,
+				APIVersion: fmt.Sprintf("%s/%s", bfdAPIGroup, bfdAPIVersion),
+			},
 			ObjectMeta: metaV1.ObjectMeta{
 				Name:      name,
 				Namespace: nsname,
@@ -60,7 +71,7 @@ func NewBFDBuilder(apiClient *clients.Settings, name, nsname string) *BFDBuilder
 }
 
 // Get returns BFDProfile object if found.
-func (builder *BFDBuilder) Get() (*metalLbV1Beta1.BFDProfile, error) {
+func (builder *BFDBuilder) Get() (*types.BFDProfile, error) {
 	if valid, err := builder.validate(); !valid {
 		return nil, err
 	}
@@ -69,11 +80,9 @@ func (builder *BFDBuilder) Get() (*metalLbV1Beta1.BFDProfile, error) {
 		"Collecting BFDProfile object %s in namespace %s",
 		builder.Definition.Name, builder.Definition.Namespace)
 
-	bfdProfile := &metalLbV1Beta1.BFDProfile{}
-	err := builder.apiClient.Get(context.TODO(), goclient.ObjectKey{
-		Name:      builder.Definition.Name,
-		Namespace: builder.Definition.Namespace,
-	}, bfdProfile)
+	unsObject, err := builder.apiClient.Resource(
+		GetBFDProfileGVR()).Namespace(builder.Definition.Namespace).Get(
+		context.TODO(), builder.Definition.Name, metaV1.GetOptions{})
 
 	if err != nil {
 		glog.V(100).Infof(
@@ -83,7 +92,7 @@ func (builder *BFDBuilder) Get() (*metalLbV1Beta1.BFDProfile, error) {
 		return nil, err
 	}
 
-	return bfdProfile, err
+	return builder.convertToStructured(unsObject)
 }
 
 // Exists checks whether the given BFDProfile exists.
@@ -108,7 +117,7 @@ func PullBFDProfile(apiClient *clients.Settings, name, nsname string) (*BFDBuild
 
 	builder := BFDBuilder{
 		apiClient: apiClient,
-		Definition: &metalLbV1Beta1.BFDProfile{
+		Definition: &types.BFDProfile{
 			ObjectMeta: metaV1.ObjectMeta{
 				Name:      name,
 				Namespace: nsname,
@@ -149,9 +158,28 @@ func (builder *BFDBuilder) Create() (*BFDBuilder, error) {
 
 	var err error
 	if !builder.Exists() {
-		err = builder.apiClient.Create(context.TODO(), builder.Definition)
-		if err == nil {
-			builder.Object = builder.Definition
+		unstructuredBfdProfile, err := runtime.DefaultUnstructuredConverter.ToUnstructured(builder.Definition)
+
+		if err != nil {
+			glog.V(100).Infof("Failed to covert structured BFDProfile to Unstructured object")
+
+			return nil, err
+		}
+
+		unsObject, err := builder.apiClient.Resource(
+			GetBFDProfileGVR()).Namespace(builder.Definition.Namespace).Create(
+			context.TODO(), &unstructured.Unstructured{Object: unstructuredBfdProfile}, metaV1.CreateOptions{})
+
+		if err != nil {
+			glog.V(100).Infof("Failed to create BFDProfile")
+
+			return nil, err
+		}
+
+		builder.Object, err = builder.convertToStructured(unsObject)
+
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -172,7 +200,9 @@ func (builder *BFDBuilder) Delete() (*BFDBuilder, error) {
 		return builder, fmt.Errorf("BFDProfile cannot be deleted because it does not exist")
 	}
 
-	err := builder.apiClient.Delete(context.TODO(), builder.Definition)
+	err := builder.apiClient.Resource(
+		GetBFDProfileGVR()).Namespace(builder.Definition.Namespace).Delete(
+		context.TODO(), builder.Definition.Name, metaV1.DeleteOptions{})
 
 	if err != nil {
 		return builder, fmt.Errorf("can not delete BFDProfile: %w", err)
@@ -193,7 +223,17 @@ func (builder *BFDBuilder) Update(force bool) (*BFDBuilder, error) {
 		builder.Definition.Name, builder.Definition.Namespace,
 	)
 
-	err := builder.apiClient.Update(context.TODO(), builder.Definition)
+	unstructuredBfdProfile, err := runtime.DefaultUnstructuredConverter.ToUnstructured(builder.Definition)
+
+	if err != nil {
+		glog.V(100).Infof("Failed to covert structured BFDProfile to Unstructured object")
+
+		return nil, err
+	}
+
+	_, err = builder.apiClient.Resource(
+		GetBFDProfileGVR()).Namespace(builder.Definition.Namespace).Update(
+		context.TODO(), &unstructured.Unstructured{Object: unstructuredBfdProfile}, metaV1.UpdateOptions{})
 
 	if err != nil {
 		if force {
@@ -349,7 +389,7 @@ func (builder *BFDBuilder) withInterval(intervalName string, interval uint32) *B
 // GetBFDProfileGVR returns bfdprofile's GroupVersionResource which could be used for Clean function.
 func GetBFDProfileGVR() schema.GroupVersionResource {
 	return schema.GroupVersionResource{
-		Group: "metallb.io", Version: "v1beta1", Resource: "bfdprofiles",
+		Group: bfdAPIGroup, Version: bfdAPIVersion, Resource: "bfdprofiles",
 	}
 }
 
@@ -383,4 +423,20 @@ func (builder *BFDBuilder) validate() (bool, error) {
 	}
 
 	return true, nil
+}
+
+func (builder *BFDBuilder) convertToStructured(
+	unsObject *unstructured.Unstructured) (*types.BFDProfile, error) {
+	bfdProfile := &types.BFDProfile{}
+
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(unsObject.Object, bfdProfile)
+	if err != nil {
+		glog.V(100).Infof(
+			"Failed to convert from unstructured to BFDProfile object in namespace %s",
+			builder.Definition.Name, builder.Definition.Namespace)
+
+		return nil, err
+	}
+
+	return bfdProfile, err
 }
